@@ -36,7 +36,9 @@ class AnchorPanel(lf.ui.Panel):
         ui.text_disabled("Pull")
         _, reg.strength = ui.slider_float("Strength (0-1)", reg.strength, 0.0, 1.0)
         _, reg.free_radius = ui.input_float(
-            "Free radius (world units, 0=off)", reg.free_radius, 0.001, 0.01, "%.5f")
+            "Free radius (world units, 0=auto)", reg.free_radius, 0.001, 0.01, "%.5f")
+        _, reg.free_radius_spacing = ui.input_float(
+            "  auto = N x cloud spacing", reg.free_radius_spacing, 0.1, 1.0, "%.2f")
         _, reg.huber_delta = ui.input_float(
             "Huber delta (max pull dist, 0=off)", reg.huber_delta, 0.001, 0.01, "%.5f")
         _, reg.max_distance = ui.input_float(
@@ -86,6 +88,8 @@ class AnchorPanel(lf.ui.Panel):
         ui.separator()
         if reg.stat_captured:
             ui.text_wrapped(
+                f"free radius in use {reg._effective_free_radius():.5f} "
+                f"(cloud spacing {reg._nn_spacing:.5f})\n"
                 f"iter {reg.stat_iter} | anchored {reg.stat_anchored_rows}/{reg.stat_rows} rows\n"
                 f"excess mean {reg.stat_mean_excess:.6f} / max {reg.stat_max_excess:.6f}\n"
                 f"teleports {reg.stat_teleports} | appended {reg.stat_appended} | "

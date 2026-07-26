@@ -121,6 +121,8 @@ def apply_env_overrides(reg):
     reg.enabled = _b("LFS_MPC_ENABLED", reg.enabled)
     reg.strength = _f("LFS_MPC_STRENGTH", reg.strength)
     reg.free_radius = _f("LFS_MPC_FREE_RADIUS", reg.free_radius)
+    reg.free_radius_spacing = _f("LFS_MPC_FREE_RADIUS_SPACING",
+                                 reg.free_radius_spacing)
     reg.huber_delta = _f("LFS_MPC_HUBER_DELTA", reg.huber_delta)
     reg.max_distance = _f("LFS_MPC_MAX_DISTANCE", reg.max_distance)
     reg.opacity_gate = _b("LFS_MPC_OPACITY_GATE", reg.opacity_gate)
@@ -145,10 +147,28 @@ class AnchorRegularizer:
         self.enabled = False
         # Pull strength per iteration, 0..1. Fraction of the excess
         # displacement removed each step. 1.0 + huber_delta==0 => hard leash.
-        self.strength = 0.10
+        # NOTE on the default: a constant strength cannot stay "soft". The
+        # trainer's effective means learning rate varies ~38x over a run
+        # (MRNF: means_lr * decay^t * bounds.median_size(t)), while the
+        # equilibrium displacement of this proximal scheme is
+        # (per-iteration photometric push) / strength -- so a fixed strength
+        # tightens monotonically and becomes a hard freeze in the final third
+        # of every run. Measured at strength=0.10 on a real 30k run: init-row
+        # drift median 0.0837 -> 7.8e-05, i.e. frozen, with splat max-axis
+        # scale inflating 2.2x in compensation. The dead zone below is what
+        # makes the anchor structurally soft; strength then only controls how
+        # fast a runaway is reeled back to the edge of that zone.
+        self.strength = 0.01
         # Dead zone radius (world units). Inside it there is zero pull, so
-        # splats can settle onto nearby surface detail. 0 = disabled.
+        # splats can settle onto local surface detail. 0 = derive it at
+        # capture time from the point cloud itself (see free_radius_spacing).
         self.free_radius = 0.0
+        # Auto dead zone = this multiple of the captured cloud's median
+        # nearest-neighbour spacing, used when free_radius == 0. Splats need
+        # roughly 1-2 local point spacings to settle onto surface detail
+        # (measured: free drift is 1.98x the local spacing at the median).
+        # Set to 0 to disable auto-derivation and get a pure spring.
+        self.free_radius_spacing = 2.0
         # Huber clamp: per-iteration pull magnitude never exceeds
         # strength * huber_delta (bounded influence). 0 = disabled.
         # A value > 0 also bounds the damage of any undetected stale anchor.
@@ -167,8 +187,16 @@ class AnchorRegularizer:
         self.start_iter = 0
         self.stop_iter = 0  # 0 = never stop
         # Anchor rows appended/relocated by MCMC at their birth position.
-        # False = only the original init rows are ever anchored.
-        self.anchor_new_splats = True
+        # Default False: the plugin's purpose is to hold the PRE-PLACED
+        # cloud, and an MCMC birth/relocation position carries no geometric
+        # meaning. Measured with this set to True on a real 30k run, only
+        # 219198/5000000 = 4.4% of the final model was still anchored to an
+        # init point -- 95.6% of the pull acted on arbitrary sample positions,
+        # which pinned freshly relocated splats to their landing sites
+        # (relocations +48%) and let the grown population spread instead of
+        # migrating onto surfaces. Set True only if you want "freeze the
+        # model wherever each splat was born", which is a different goal.
+        self.anchor_new_splats = False
         # Row jump between consecutive iterations larger than this counts
         # as an MCMC relocation (teleport). 0 = auto (1% of scene diagonal).
         self.teleport_threshold = 0.0
@@ -196,6 +224,8 @@ class AnchorRegularizer:
         self._n = 0
         self._n0 = 0              # row count at capture (init cloud size)
         self._scene_diag = 0.0
+        self._auto_free_radius = 0.0  # derived from cloud spacing at capture
+        self._nn_spacing = 0.0
         self._baseline_valid = True   # False after any mid-run re-capture
         self._recaptured_at = -1
         self._ref_np = None       # nn mode: reference cloud as numpy [M,3]
@@ -232,6 +262,8 @@ class AnchorRegularizer:
         self._n = 0
         self._n0 = 0
         self._scene_diag = 0.0
+        self._auto_free_radius = 0.0
+        self._nn_spacing = 0.0
         self._baseline_valid = True
         self._recaptured_at = -1
         self._ref_np = None
@@ -273,6 +305,24 @@ class AnchorRegularizer:
             lf.Tensor.zeros([n, 1], device="cuda", dtype="float32"),
         )
 
+    @staticmethod
+    def _median_nn_spacing(pos, sample=200000):
+        """Median nearest-neighbour distance of a point cloud (subsampled)."""
+        try:
+            import numpy as np
+            from scipy.spatial import cKDTree
+        except ImportError:
+            return 0.0
+        if len(pos) > sample:
+            step = len(pos) // sample
+            pos = pos[::step]
+        d, _ = cKDTree(pos).query(pos, k=2, workers=-1)
+        return float(np.median(d[:, 1]))
+
+    def _effective_free_radius(self):
+        """User value if set, else the spacing-derived dead zone."""
+        return self.free_radius if self.free_radius > 0.0 else self._auto_free_radius
+
     def _teleport_thresh(self):
         if self.teleport_threshold > 0.0:
             return self.teleport_threshold
@@ -306,11 +356,23 @@ class AnchorRegularizer:
             self._baseline_valid = False
             self._recaptured_at = it
         try:
-            mn = means.min(dim=0)
-            mx = means.max(dim=0)
-            self._scene_diag = float(((mx - mn) * (mx - mn)).sum().sqrt().item())
+            # Robust extent: a raw min/max bounding box is dominated by the
+            # handful of far-flung outlier points every SfM cloud carries
+            # (observed: 135 stray points inflating a 37-unit object to a
+            # 332000-unit box), which would make the auto teleport threshold
+            # thousands of times too large. Use a per-axis 1-99 percentile
+            # span instead; on a clean cloud this equals the bounding box.
+            import numpy as np
+            pos = means.numpy(copy=True).reshape(-1, 3)
+            lo = np.percentile(pos, 1.0, axis=0)
+            hi = np.percentile(pos, 99.0, axis=0)
+            self._scene_diag = float(np.linalg.norm(hi - lo))
+            self._nn_spacing = self._median_nn_spacing(pos)
+            self._auto_free_radius = self.free_radius_spacing * self._nn_spacing
         except Exception:
             self._scene_diag = 0.0
+            self._nn_spacing = 0.0
+            self._auto_free_radius = 0.0
             lf.log.warn(
                 "[maintain_pointcloud] scene diagonal computation failed; "
                 "auto teleport detection is DISABLED (set teleport_threshold "
@@ -319,7 +381,11 @@ class AnchorRegularizer:
         self.stat_captured = True
         lf.log.info(
             f"[maintain_pointcloud] anchors captured: {n} rows, "
-            f"scene diag ~{self._scene_diag:.4f}"
+            f"scene diag ~{self._scene_diag:.4f}, "
+            f"nn spacing ~{self._nn_spacing:.5f}, "
+            f"free radius {self._effective_free_radius():.5f}"
+            f"{' (auto)' if self.free_radius <= 0.0 else ''}, "
+            f"teleport thresh {self._teleport_thresh():.4f}"
             + ("" if initial else f" (RE-capture at iter {it}; init-drift "
                f"baseline no longer refers to training start)")
         )
@@ -543,7 +609,7 @@ class AnchorRegularizer:
         # Snapshot panel-tunable scalars once (the UI thread may edit them
         # between any two statements below).
         strength_s = self._strength_at(it)
-        free_radius = self.free_radius
+        free_radius = self._effective_free_radius()
         huber_delta = self.huber_delta
         max_distance = self.max_distance
         min_pull_op = self.min_pull_opacity
@@ -695,6 +761,9 @@ class AnchorRegularizer:
             "enabled": self.enabled,
             "strength": self.strength,
             "free_radius": self.free_radius,
+            "free_radius_spacing": self.free_radius_spacing,
+            "free_radius_effective": self._effective_free_radius(),
+            "nn_spacing": self._nn_spacing,
             "huber_delta": self.huber_delta,
             "max_distance": self.max_distance,
             "opacity_gate": self.opacity_gate,
@@ -711,7 +780,11 @@ class AnchorRegularizer:
             "log_every": self.log_every,
         }
 
+    _READONLY_CFG = ("free_radius_effective", "nn_spacing")
+
     def load_config(self, cfg):
         for k, v in (cfg or {}).items():
+            if k in self._READONLY_CFG:
+                continue  # reported for the record, not settable
             if hasattr(self, k) and not k.startswith("_") and not k.startswith("stat_"):
                 setattr(self, k, v)
