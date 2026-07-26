@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+settings.json
+uv.lock
+*.log
+.claude/

@@ -1,0 +1,16 @@
+[project]
+name = "maintain_pointcloud"
+version = "0.1.0"
+description = "Soft position anchor: keep 3DGS splats near the pre-placed initial point cloud during LichtFeld Studio training (LI-GS / GeomGS / EnerGS-inspired regularizer)"
+authors = [{ name = "Toru Hashimoto" }]
+license = { text = "GPL-3.0-or-later" }
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[tool.lichtfeld]
+hot_reload = true
+plugin_api = ">=1,<2"
+lichtfeld_version = ">=0.4.2"
+required_features = []
