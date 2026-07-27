@@ -99,7 +99,8 @@ LichtFeld-Studio.exe --headless --train -d <dataset> -o <out> --iter 30000 \
 | `LFS_MPC_TELEPORT` | テレポート判定距離 | `0`（自動: 頑健シーン対角の 1%） |
 | `LFS_MPC_MODE` | `index` / `nn` | `index` |
 | `LFS_MPC_REF_PLY` | nn モードの参照 PLY | （初期スナップショット） |
-| `LFS_MPC_STATS_OUT` | 終了時ドリフト統計 JSON の出力先 | （出力しない） |
+| `LFS_MPC_STATS_OUT` | ドリフト統計 JSON の出力先 | （出力しない） |
+| `LFS_MPC_SNAPSHOT_EVERY` | 統計 JSON を書き直す間隔（iter）。0 で無効 | `1000` |
 | `LFS_MPC_CONFIG` | 全パラメータをまとめた JSON | — |
 
 ## 独自パラメータ一覧
@@ -117,16 +118,42 @@ LichtFeld-Studio.exe --headless --train -d <dataset> -o <out> --iter 30000 \
 | `stop_iter` | 後半を自由にしたい場合のみ設定 | 0（維持目的なら切らない） |
 | `anchor_new_splats` | MCMC が追加/再配置した行も誕生位置で固定するか | **False（既定）**。True は「初期点群維持」ではなく「全体凍結」になる |
 | `mode` | `index`（誕生位置）/ `nn`（参照点群への最近傍） | まず `index` |
+| `stats_snapshot_every` | 統計 JSON を書き直す間隔。最後に書けたものが最終結果になる | 1000。厳密に終端付近が欲しければ 100–200 |
 
 ## 検証のしかた
 
-`LFS_MPC_STATS_OUT` を指定すると、学習終了時に「初期行の初期位置からのドリフト統計」
+`LFS_MPC_STATS_OUT` を指定すると、「初期行の初期位置からのドリフト統計」
 （mean / median / p95 / max、シーン対角付き）が JSON で出力されます。
 MCMC 再配置でスロットが再利用された行は自動除外され（`rows_measured` / `rows_excluded`）、
 途中で全再キャプチャが起きた場合は `baseline_valid: false` が付きます。
 アンカー無効・有効の 2 回を回して比較してください。MCMC はシード固定不可のため、
 厳密な評価ではベースラインを 2 本回してノイズフロアを見ることを推奨します
-（テストは `python mpc_tests/test_reference_math.py` で数式のリファレンス実装を検証できます）。
+（テストは `python -m pytest mpc_tests/` で数式のリファレンス実装とスケジューリング
+ロジックを検証できます）。
+
+この JSON は学習終了時だけでなく `stats_snapshot_every` iter ごとに上書きされ、
+**最後に書けたものが最終結果**になります。ファイル自身が `iter`（どの iteration の
+状態か）と `final`（学習終了フックから書かれたか）を持つので、終端との差は判別できます。
+定期書き出しにしているのは利便性のためではありません。LichtFeld Studio v0.5.1 の
+ヘッドレス実行は training_end フックを登録はするものの一度も発火させず、埋め込み
+Python は `atexit` も実行しないため、終了時にだけ書く実装では**ファイルが 1 つも
+生成されません**。
+
+まず最初に見るべきは `applied_iters` です。**0 なら補正は一度も適用されていません**
+（`enabled` の既定は False）。
+
+### ヘッドレス実行時の注意（v0.5.1 で確認）
+
+- `--headless` と `--python-script` は併用できます。ただし **`--python-script` を
+  渡さないと Python ランタイム自体が起動せず、プラグインも読み込まれません。**
+- `--python-script` で `headless_anchor.py` を使う場合、LichtFeld Studio が
+  有効化するのは共有 venv（`~/.lichtfeld/venv`）であって、プラグイン自身の
+  `.venv` ではありません。`headless_anchor.py` は隣接する `.venv` を自動で
+  `sys.path` に追加しますが、numpy / scipy がどこにも無い場合は起動時に
+  エラーログを出します。**この警告を無視しないでください**: 依存が欠けると
+  自動不感帯が 0 に落ち、固定 strength と組み合わさって終盤の完全凍結に至ります。
+- `--steps-scaler` を極端に小さくすると（実測: 0.002）密度制御のスケジュール値が
+  0 に切り捨てられ、ゼロ除算で異常終了します。短縮する場合も 0.003 以上を推奨。
 
 ## 実測（実データ 30000 iter A/B、検証済み）
 

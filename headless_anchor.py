@@ -26,7 +26,39 @@ _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
+from venv_bootstrap import find_venv_site_packages  # noqa: E402
+
+# LichtFeld Studio activates a plugin's own .venv only when it *loads that
+# plugin*. Run as --python-script the interpreter gets the shared
+# ~/.lichtfeld/venv instead, which does not carry this plugin's numpy/scipy.
+_site = find_venv_site_packages(_here)
+if _site and _site not in sys.path:
+    sys.path.insert(0, _site)
+
 from anchor_core import AnchorRegularizer, apply_env_overrides  # noqa: E402
+
+# Missing numpy/scipy does not raise: capture catches it and falls back to
+# scene_diag = 0 (teleport detection off) and nn_spacing = 0 (no dead zone).
+# A fixed strength with no dead zone is exactly the hard-freeze failure mode
+# the dead zone exists to prevent, so say so loudly rather than degrade.
+_missing = []
+try:
+    import numpy  # noqa: F401
+except ImportError:
+    _missing.append("numpy (scene diagonal + teleport detection + drift stats)")
+try:
+    from scipy.spatial import cKDTree  # noqa: F401
+except ImportError:
+    _missing.append("scipy (automatic dead zone from point spacing)")
+if _missing:
+    lf.log.error(
+        "[maintain_pointcloud/headless] MISSING DEPENDENCIES: "
+        + "; ".join(_missing)
+        + f". Searched {_site or _here + os.sep + '.venv (absent)'}. "
+        "The anchor will run with free_radius=0, which turns a fixed "
+        "strength into a hard freeze late in training. Install them into "
+        "the plugin venv or ~/.lichtfeld/venv before trusting this run."
+    )
 
 reg = AnchorRegularizer()
 reg.enabled = True  # headless default: on (override with LFS_MPC_ENABLED=0)
