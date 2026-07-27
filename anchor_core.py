@@ -77,8 +77,10 @@ import lichtfeld as lf
 
 try:  # package import (plugin) vs. flat import (--python-script)
     from .stats_policy import should_snapshot
+    from .drift_stats import drift_percentiles
 except ImportError:  # pragma: no cover - exercised by headless_anchor.py
     from stats_policy import should_snapshot
+    from drift_stats import drift_percentiles
 
 _EPS = 1e-12
 _BIG = 1e30
@@ -814,22 +816,25 @@ class AnchorRegularizer:
         d = d_all[keep]
         if d.size == 0:
             d = d_all  # degenerate: everything relocated; report unfiltered
-        return {
+        out = {
             "rows": int(n0),
             "rows_measured": int(keep.sum()),
             "rows_excluded": int(n0 - keep.sum()),
             "baseline_valid": bool(self._baseline_valid),
             "recaptured_at_iter": int(self._recaptured_at),
-            "mean": float(d.mean()),
-            "median": float(np.median(d)),
-            "p95": float(np.percentile(d, 95)),
-            "max": float(d.max()),
+        }
+        # p50/p75/p90/p95 together, not just the median: the dead zone leaves
+        # the bulk of the rows free, so the median tracks the unanchored
+        # baseline and only the upper tail shows what the leash did.
+        out.update(drift_percentiles(d))
+        out.update({
             "scene_diag": float(self._scene_diag),
             "teleports": int(self.stat_teleports),
             "appended": int(self.stat_appended),
             "errors": int(self.stat_errors),
             "applied_iters": int(self.stat_applied_iters),
-        }
+        })
+        return out
 
     # ------------------------------------------------------------ configuration
     def config_dict(self):
