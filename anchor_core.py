@@ -75,6 +75,13 @@ import os
 
 import lichtfeld as lf
 
+try:  # package import (plugin) vs. flat import (--python-script)
+    from .stats_policy import should_snapshot
+    from .drift_stats import drift_percentiles
+except ImportError:  # pragma: no cover - exercised by headless_anchor.py
+    from stats_policy import should_snapshot
+    from drift_stats import drift_percentiles
+
 _EPS = 1e-12
 _BIG = 1e30
 
@@ -136,6 +143,9 @@ def apply_env_overrides(reg):
     reg.reference_ply = os.environ.get("LFS_MPC_REF_PLY", reg.reference_ply)
     reg.nn_refresh = _i("LFS_MPC_NN_REFRESH", reg.nn_refresh)
     reg.log_every = _i("LFS_MPC_LOG_EVERY", reg.log_every)
+    reg.stats_out = os.environ.get("LFS_MPC_STATS_OUT", reg.stats_out)
+    reg.stats_snapshot_every = _i("LFS_MPC_SNAPSHOT_EVERY",
+                                  reg.stats_snapshot_every)
     return reg
 
 
@@ -208,6 +218,15 @@ class AnchorRegularizer:
         # Stats cadence (GPU->CPU scalar syncs); logging cadence.
         self.stats_every = 10
         self.log_every = 0  # 0 = no periodic log
+        # Where to write the drift-stats JSON ("" = LFS_MPC_STATS_OUT, if set).
+        self.stats_out = ""
+        # How often to re-write that JSON from the post_step hook. This is not
+        # a convenience: LichtFeld Studio v0.5.1 registers the training_end
+        # hook but never dispatches it in headless mode, and its embedded
+        # interpreter does not run atexit handlers either, so a run that only
+        # wrote stats at the end would produce no file at all. Snapshotting
+        # makes the last successful write the final result. 0 disables it.
+        self.stats_snapshot_every = 1000
 
         # --- cross-thread request flags (set by UI, serviced in apply()) -----
         self._reset_requested = False
@@ -233,6 +252,7 @@ class AnchorRegularizer:
         self._ref_built_from = None   # reference_ply value the tree was built
         #                               from (recorded even on failed loads)
         self._last_nn_iter = -1
+        self._last_snapshot_it = -1   # iteration of the last stats file write
 
         # --- read-only stats (panel display) ----------------------------------
         self.stat_iter = 0
@@ -270,6 +290,7 @@ class AnchorRegularizer:
         self._kdtree = None
         self._ref_built_from = None
         self._last_nn_iter = -1
+        self._last_snapshot_it = -1
         self.stat_teleports = 0
         self.stat_appended = 0
         self.stat_applied_iters = 0
@@ -622,6 +643,11 @@ class AnchorRegularizer:
             if self.mode == "nn":
                 self._nn_retarget(means, it)
 
+            # Before the zero-strength early return below: a baseline run
+            # (enabled=False) still has to produce drift statistics, since
+            # that is the noise floor every effect size is measured against.
+            self._maybe_snapshot_stats(it)
+
             want_stats = stats_every > 0 and (it % stats_every == 0)
             if strength_s <= 0.0 and not want_stats:
                 self._prev = means.clone()
@@ -691,6 +717,64 @@ class AnchorRegularizer:
         # per-iteration hook (rows 0..N0 are exactly the init cloud there).
         self.reset()
 
+    def _resolve_stats_out(self):
+        """Stats path: explicit parameter wins, else the environment."""
+        return self.stats_out or os.environ.get("LFS_MPC_STATS_OUT", "")
+
+    def _write_stats(self, out, stats, it, final):
+        """Overwrite the stats JSON. Returns True on success.
+
+        `applied_iters` belongs in the file rather than only in the end-of-run
+        log line: on runtimes that never dispatch training_end (see
+        stats_snapshot_every) that log line is never emitted either, and
+        `applied_iters == 0` is the one check that distinguishes "the anchor
+        did nothing" from "the anchor did nothing measurable".
+        """
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump({"enabled": self.enabled,
+                           "iter": it,
+                           "final": final,
+                           "applied_iters": self.stat_applied_iters,
+                           "teleports": self.stat_teleports,
+                           "appended": self.stat_appended,
+                           "errors": self.stat_errors,
+                           "config": self.config_dict(),
+                           "init_drift": stats}, f, indent=2)
+            return True
+        except OSError as e:
+            lf.log.error(f"[maintain_pointcloud] stats write failed: {e}")
+            return False
+
+    def _maybe_snapshot_stats(self, it):
+        """Periodically write the stats JSON from inside the post_step hook.
+
+        LichtFeld Studio v0.5.1 registers the training_end hook but never
+        dispatches it in headless mode, and its embedded interpreter does not
+        run atexit handlers, so on_training_end alone yields no file at all.
+        Writing here makes the last successful write the final result; the
+        `iter`/`final` fields say which iteration it reflects.
+        """
+        out = self._resolve_stats_out()
+        if not out:
+            return
+        if not should_snapshot(it, self._last_snapshot_it,
+                               self.stats_snapshot_every):
+            return
+        # Measurement must never be able to damage the regularizer: a failure
+        # here is contained instead of unwinding into apply()'s error path,
+        # which would drop the teleport-detection snapshots for this iteration.
+        try:
+            stats = self.init_drift_stats()
+            if stats is None:
+                return
+            if self._write_stats(out, stats, it, final=False):
+                self._last_snapshot_it = it
+        except Exception as e:
+            self._last_snapshot_it = it   # do not retry every iteration
+            lf.log.error(
+                f"[maintain_pointcloud] stats snapshot failed at iter {it}: {e!r}")
+
     def on_training_end(self, _hook):
         stats = self.init_drift_stats()
         if stats is not None:
@@ -702,15 +786,9 @@ class AnchorRegularizer:
             f"final mean_excess={self.stat_mean_excess:.6f}, "
             f"max_excess={self.stat_max_excess:.6f}"
         )
-        out = os.environ.get("LFS_MPC_STATS_OUT", "")
+        out = self._resolve_stats_out()
         if out and stats is not None:
-            try:
-                with open(out, "w", encoding="utf-8") as f:
-                    json.dump({"enabled": self.enabled,
-                               "config": self.config_dict(),
-                               "init_drift": stats}, f, indent=2)
-            except OSError as e:
-                lf.log.error(f"[maintain_pointcloud] stats write failed: {e}")
+            self._write_stats(out, stats, self.stat_iter, final=True)
 
     # ------------------------------------------------------------- measurement
     def init_drift_stats(self):
@@ -738,22 +816,25 @@ class AnchorRegularizer:
         d = d_all[keep]
         if d.size == 0:
             d = d_all  # degenerate: everything relocated; report unfiltered
-        return {
+        out = {
             "rows": int(n0),
             "rows_measured": int(keep.sum()),
             "rows_excluded": int(n0 - keep.sum()),
             "baseline_valid": bool(self._baseline_valid),
             "recaptured_at_iter": int(self._recaptured_at),
-            "mean": float(d.mean()),
-            "median": float(np.median(d)),
-            "p95": float(np.percentile(d, 95)),
-            "max": float(d.max()),
+        }
+        # p50/p75/p90/p95 together, not just the median: the dead zone leaves
+        # the bulk of the rows free, so the median tracks the unanchored
+        # baseline and only the upper tail shows what the leash did.
+        out.update(drift_percentiles(d))
+        out.update({
             "scene_diag": float(self._scene_diag),
             "teleports": int(self.stat_teleports),
             "appended": int(self.stat_appended),
             "errors": int(self.stat_errors),
             "applied_iters": int(self.stat_applied_iters),
-        }
+        })
+        return out
 
     # ------------------------------------------------------------ configuration
     def config_dict(self):
@@ -778,6 +859,8 @@ class AnchorRegularizer:
             "nn_refresh": self.nn_refresh,
             "stats_every": self.stats_every,
             "log_every": self.log_every,
+            "stats_out": self.stats_out,
+            "stats_snapshot_every": self.stats_snapshot_every,
         }
 
     _READONLY_CFG = ("free_radius_effective", "nn_spacing")
