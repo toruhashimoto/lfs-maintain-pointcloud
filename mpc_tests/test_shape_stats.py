@@ -9,7 +9,7 @@ DESIGN.md traces the mechanism to MRNF's long-axis split -- the anchor pulls
 the parent back to the pre-split centre while the halved long axis stays
 halved, and the unregularised scaling_lr regrows it along that same axis.
 
-That cost has never been measured on the crash dataset, so the statistic has
+That cost has never been measured on dataset B, so the statistic has
 to exist before the campaign runs.
 
 Tolerances are relative, not absolute: the implementation exponentiates in

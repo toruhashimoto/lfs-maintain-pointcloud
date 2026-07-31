@@ -200,9 +200,9 @@ if ($Plan -eq 'datacbox')   { $runs = $datacbox }
 if ($Plan -eq 'datacfull')  { $runs = $datacfull }
 
 # ---------------------------------------------------------------------------
-# dataset D: a SECOND vehicle with the operator's own cleanup as the
+# dataset D: a SECOND subject with the operator's own cleanup as the
 # label (splat_109800.ply raw vs splat_109800b.ply cleaned). This is the
-# replication of the C result on a different vehicle, which is the only
+# replication of the C result on a different subject, which is the only
 # thing that can promote "crop the input cloud" from one measurement to a
 # rule.
 #
@@ -227,11 +227,11 @@ $datad = @(
     @{ id = 'L_nn_2';      en = 1; cal = 1; sp = 2.0; cap = 5000000; it = $Iters; nn = 1; anew = 1; q = 70 }
 )
 
-# The crop uses the NOMINAL box, not this vehicle's delivered box. Cropping to
+# The crop uses the NOMINAL box, not this subject's delivered box. Cropping to
 # the delivered box would leak the label into the input and inflate the
 # result; in production the delivered box does not exist yet. The nominal box
 # is -1,-1.5,-1:3,0.5,1 (centre [1,-0.5,0], size [4,2,2]) plus the default 5%
-# pad, and it contains BOTH vehicles' delivered boxes -- the low-corner gaps
+# pad, and it contains BOTH datasets' delivered boxes -- the low-corner gaps
 # on this one are [0.001, 0.041, 0.000] and the z faces match exactly.
 # Invoke with -Data ...\colmap_cropped (crop_input.py builds it).
 $datadcrop = @(
@@ -348,7 +348,7 @@ foreach ($r in $runs) {
     $env:LFS_MPC_MODE       = $(if ($nn -eq 1) { 'nn' } else { 'index' })
     $env:LFS_MPC_ANCHOR_NEW = "$anew"
     $env:LFS_MPC_NN_REFRESH = '100'
-    # Nominal ROI for this vehicle class, from the delivered model's own box.
+    # Nominal ROI for this subject class, from the delivered model's own box.
     $box = if ($r.ContainsKey('box')) { $r.box } else { 0 }
     $env:LFS_MPC_CROP_BOX = $(if ($box -eq 1) { '-0.8777,-1.2579,-1.0:3.1204,0.3682,1.0' } else { '' })
     $env:LFS_MPC_CROP_BOX_PAD = '0.05'

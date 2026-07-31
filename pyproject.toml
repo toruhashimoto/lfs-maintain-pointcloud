@@ -1,6 +1,6 @@
 [project]
 name = "maintain_pointcloud"
-version = "1.0.0"
+version = "1.0.1"
 description = "Keep 3DGS true to a pre-placed point cloud in LichtFeld Studio: soft position anchor during training (LI-GS / GeomGS / EnerGS-inspired) + input-cloud crop before training (RealityScan-style region of interest)"
 authors = [{ name = "Toru Hashimoto" }]
 license = { text = "GPL-3.0-or-later" }

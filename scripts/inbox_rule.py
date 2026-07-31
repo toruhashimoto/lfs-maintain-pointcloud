@@ -1,30 +1,30 @@
 # SPDX-FileCopyrightText: 2026 Toru Hashimoto
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Do per-splat features predict the operator's IN-BOX removals, across vehicles?
+"""Do per-splat features predict the operator's IN-BOX removals, across datasets?
 
 Usage:
     python scripts/inbox_rule.py NAME RAW.ply CLEAN.ply points3D.txt \
                                 [NAME2 RAW2.ply CLEAN2.ply points3D2.txt ...]
 
-One vehicle gives the within-vehicle table; two or more add the transfer
+One dataset gives the within-dataset table; two or more add the transfer
 tests, which are the point.
 
-What this measured on C + D (n=2 vehicles, preliminary)
+What this measured on C + D (n=2 datasets, preliminary)
 ----------------------------------------------------------------
 Out-of-box removals are solved by cropping the input cloud. The remaining
 19.7-25.2% of the manual work is in-box, at base rates of 0.39% and 1.82%.
 
   * The feature ORDERING is shared. Of eight features, the informative two
-    are the same on both vehicles: distance to the nearest face of the
+    are the same on both datasets: distance to the nearest face of the
     delivered box (removals hug the boundary) and local density of the
     surveyed cloud (removals stand where the survey is sparse).
   * Absolute thresholds do NOT transfer. A threshold picked at recall 30%
-    on one vehicle collapses to 1.8% recall or 5.5% precision on the other:
-    the scales are vehicle-specific even when the ranking is not.
+    on one dataset collapses to 1.8% recall or 5.5% precision on the other:
+    the scales are dataset-specific even when the ranking is not.
   * Quantile ranks DO transfer, and need no labels: quantiles come from the
     unlabeled model itself. Flagging the worst 5% by mean quantile of
     (face, dens8) catches 51.1% / 53.2% of the in-box removals on the two
-    vehicles. Precision follows the base rate (4.0% / 19.4%), so this is a
+    datasets. Precision follows the base rate (4.0% / 19.4%), so this is a
     REVIEW shortlist -- roughly half the in-box handwork concentrated into
     5% of the model -- not an auto-delete.
 
@@ -33,7 +33,7 @@ rule is available the moment training ends, with no labels and no tuning.
 
 The removed set is recovered by exact float32 XYZ match between the raw and
 cleaned PLYs (the cleaned model is a row-subset of the raw one; verified
-exact on both vehicles, 5,000,000 rows, no duplicate positions).
+exact on both datasets, 5,000,000 rows, no duplicate positions).
 """
 
 import os
@@ -95,7 +95,7 @@ def _keys(xyz):
     return np.ascontiguousarray(xyz, dtype=np.float32).view(DT).ravel()
 
 
-def build_vehicle(name, raw_ply, clean_ply, points3d):
+def build_subject(name, raw_ply, clean_ply, points3d):
     """Visible in-box splats of the raw model: removed flag + features.
 
     Cached beside the raw PLY (the inputs it derives from), keyed by the
@@ -176,15 +176,15 @@ def main(argv):
     if len(argv) < 4 or len(argv) % 4:
         print(__doc__)
         return 2
-    vehicles = {argv[i]: build_vehicle(*argv[i:i + 4])
+    datasets = {argv[i]: build_subject(*argv[i:i + 4])
                 for i in range(0, len(argv), 4)}
 
-    for name, d in vehicles.items():
+    for name, d in datasets.items():
         removed = d["removed"].astype(bool)
         base = removed.mean()
         print("\n=== %s: %d in-box visible, removed %.3f%% ==="
               % (name, len(removed), 100 * base))
-        print("  within-vehicle precision at recall 30%:")
+        print("  within-dataset precision at recall 30%:")
         for feat in FEATURES:
             _, prec = precision_at_recall(suspicion(d, feat),
                                           d["removed"], 0.30)
@@ -200,14 +200,14 @@ def main(argv):
                   % (100 * q, 100 * tp / max(int(s.sum()), 1),
                      100 * tp / max(int(removed.sum()), 1)))
 
-    names = list(vehicles)
+    names = list(datasets)
     if len(names) > 1:
         print("\n=== absolute-threshold transfer (recall 30%% on A -> B) ===")
         for a in names:
             for b in names:
                 if a == b:
                     continue
-                da, db = vehicles[a], vehicles[b]
+                da, db = datasets[a], datasets[b]
                 base_b = db["removed"].mean()
                 print("  %s -> %s (base %.3f%%)" % (a, b, 100 * base_b))
                 for feat in FEATURES:

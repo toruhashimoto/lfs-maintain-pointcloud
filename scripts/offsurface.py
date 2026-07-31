@@ -10,9 +10,9 @@ Why this measurement
 Everything measured so far shows the leash holds the INITIAL rows near their
 anchors, and that it costs nothing photometrically. Neither says the model
 is better: hold-out PSNR is identical between arms, so at evaluation views
-the two are indistinguishable. The claim that actually matters for a crash
-model -- "there is no geometry here that is not on the real object" -- has
-never been tested.
+the two are indistinguishable. The claim that actually matters for a
+measurement-grade model -- "there is no geometry here that is not on the
+real object" -- has never been tested.
 
 Testing it with the initial rows would be circular: the leash holds them
 near their anchors, and their anchors ARE cloud points, so of course they

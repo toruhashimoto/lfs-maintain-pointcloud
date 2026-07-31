@@ -127,6 +127,46 @@ class InputCropPanel(lf.ui.Panel):
         return (tuple(min(a, b) for a, b in zip(lo, hi)),
                 tuple(max(a, b) for a, b in zip(lo, hi)))
 
+    def _write_box(self, cb_id, box):
+        scene = lf.get_scene()
+        cb = scene.get_cropbox_data(cb_id)
+        lo, hi = box
+        cb.set("min", tuple(float(v) for v in lo))
+        cb.set("max", tuple(float(v) for v in hi))
+        cb.set("enabled", True)
+        scene.set_cropbox_data(cb_id, cb)
+
+    def _set_crop_gizmo(self, gizmo_type):
+        """Switch the active crop tool's gizmo (translate/scale).
+
+        Same call the main toolbar makes; exposed here so resizing is one
+        click from the panel instead of a toolbar hunt.
+        """
+        try:
+            lf.ui.set_active_operator("builtin.cropbox", gizmo_type)
+            self.status = "crop gizmo: %s" % gizmo_type
+        except Exception as exc:
+            self.status = ("gizmo switch failed (%s); use the main "
+                           "toolbar's move/scale instead" % exc)
+
+    def _select_box_node(self, cb_id):
+        """Select the crop box node, which activates the engine's crop tool.
+
+        The gizmo is selection-driven: the viewer's NodeSelected handler is
+        what calls setActiveOperator("builtin.cropbox"). A box that is merely
+        VISIBLE has no gizmo, which is exactly the "I can see it but cannot
+        adjust it" report this fixes.
+        """
+        try:
+            scene = lf.get_scene()
+            for node in scene.get_nodes():
+                if int(node.id) == int(cb_id):
+                    lf.select_node(node.name)
+                    return True
+        except Exception as exc:
+            self.status = "select failed: %s" % exc
+        return False
+
     # --------------------------------------------------------------- workers
     def _start(self, label, fn):
         if self._busy:
@@ -192,8 +232,9 @@ class InputCropPanel(lf.ui.Panel):
             found = self._scene_box(create=False)
         except Exception:
             found = None
+        cb_id = None
         if found is not None:
-            cb, _ = found
+            cb, cb_id = found
             box = self._read_box(cb)
             enabled = bool(cb.get("enabled"))
             inverse = bool(cb.get("inverse"))
@@ -204,9 +245,68 @@ class InputCropPanel(lf.ui.Panel):
                 ui.text_wrapped(
                     "This crop box is INVERTED (keeps the outside). "
                     "Export is disabled: it would delete the subject.")
+
+            # Numeric editing: exact, always available, no tool required.
+            # Two equivalent representations, SuperSplat-style: corner
+            # min/max, and center+size (the natural one for "make it
+            # smaller"). Both write straight into the crop box data, so
+            # they are always what the export will use.
+            lo, hi = list(box[0]), list(box[1])
+            changed = False
+            for axis in range(3):
+                c, lo[axis] = ui.input_float(
+                    "min %s" % "xyz"[axis], lo[axis], 0.01, 0.1, "%.4f")
+                changed = changed or c
+                ui.same_line()
+                c, hi[axis] = ui.input_float(
+                    "max %s" % "xyz"[axis], hi[axis], 0.01, 0.1, "%.4f")
+                changed = changed or c
+
+            center = [(l + h) / 2.0 for l, h in zip(lo, hi)]
+            size = [max(h - l, 1e-3) for l, h in zip(lo, hi)]
+            resized = False
+            for axis in range(3):
+                c, center[axis] = ui.input_float(
+                    "center %s" % "xyz"[axis], center[axis], 0.01, 0.1,
+                    "%.4f")
+                resized = resized or c
+                ui.same_line()
+                c, size[axis] = ui.input_float(
+                    "size %s" % "xyz"[axis], size[axis], 0.01, 0.1, "%.4f")
+                resized = resized or c
+            if ui.button("Shrink 5%"):
+                size = [s * 0.95 for s in size]
+                resized = True
+            ui.same_line()
+            if ui.button("Expand 5%"):
+                size = [s * 1.05 for s in size]
+                resized = True
+            if resized:
+                size = [max(s, 1e-3) for s in size]
+                lo = [c - s / 2.0 for c, s in zip(center, size)]
+                hi = [c + s / 2.0 for c, s in zip(center, size)]
+                changed = True
+
+            if changed:
+                try:
+                    self._write_box(cb_id, (tuple(lo), tuple(hi)))
+                    box = (tuple(lo), tuple(hi))
+                except Exception as exc:
+                    self.status = "box update failed: %s" % exc
+
+            if ui.button("Move (gizmo)"):
+                if self._select_box_node(cb_id):
+                    self._set_crop_gizmo("translate")
+            ui.same_line()
+            if ui.button("Scale (gizmo)"):
+                if self._select_box_node(cb_id):
+                    self._set_crop_gizmo("scale")
             ui.text_disabled(
-                "Adjust with the viewer's crop-box tool. Box-node rotation "
-                "is NOT reflected in the export (axis-aligned only).")
+                "Selecting the box (here or in the scene panel) activates "
+                "the crop tool; the main toolbar's move/scale also switches "
+                "the gizmo. After a gizmo drag, check the numbers above "
+                "followed -- the export uses exactly these min/max values. "
+                "Box-node rotation is NOT exported (axis-aligned only).")
         else:
             box = None
             ui.text_wrapped("No crop box on the training model yet. "
@@ -214,8 +314,11 @@ class InputCropPanel(lf.ui.Panel):
 
         if ui.button("Seed default region"):
             try:
-                self._scene_box(create=True, seed=parse_box(DEFAULT_ROI))
+                seeded = self._scene_box(create=True,
+                                         seed=parse_box(DEFAULT_ROI))
                 self.status = "seeded %s" % DEFAULT_ROI
+                if seeded is not None:
+                    self._select_box_node(seeded[1])
             except Exception as exc:
                 self.status = "seed failed: %s" % exc
         ui.same_line()
@@ -263,8 +366,10 @@ class InputCropPanel(lf.ui.Panel):
                    total * COUNT_SAMPLE_EVERY, self.pad))
         elif kind == "fit":
             try:
-                self._scene_box(create=True, seed=res[1])
+                seeded = self._scene_box(create=True, seed=res[1])
                 self.status = "fitted box to cloud percentiles"
+                if seeded is not None:
+                    self._select_box_node(seeded[1])
             except Exception as exc:
                 self.status = "fit apply failed: %s" % exc
             self._result = None

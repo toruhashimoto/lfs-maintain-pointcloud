@@ -38,7 +38,7 @@ from cleanup_cost import read_ply  # noqa: E402
 MIN_VISIBLE = 0.01              # the same gate the anchor pull uses
 DT = np.dtype([("x", np.float32), ("y", np.float32), ("z", np.float32)])
 
-# Confirmed against both vehicles' delivered boxes. Centre [1,-0.5,0],
+# Confirmed against both datasets' delivered boxes. Centre [1,-0.5,0],
 # size [4,2,2]. Reported here so a new capture can be checked against it.
 NOMINAL = (np.array([-1.0, -1.5, -1.0]), np.array([3.0, 0.5, 1.0]))
 
@@ -79,7 +79,7 @@ def main(argv):
     print("\nremovals explained by the box")
     print("  outside %8d  (%.1f%%)   <- what cropping the input attacks"
           % ((~rm_in).sum(), 100.0 * (~rm_in).sum() / n_removed))
-    print("  inside  %8d  (%.1f%%)   <- per-vehicle judgement"
+    print("  inside  %8d  (%.1f%%)   <- per-subject judgement"
           % (rm_in.sum(), 100.0 * rm_in.sum() / n_removed))
 
     vis_raw = raw_op >= MIN_VISIBLE

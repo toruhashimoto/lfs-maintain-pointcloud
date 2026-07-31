@@ -8,7 +8,7 @@ Comparing the delivered model against the raw one on the C capture,
 74.8% of everything the operator removed by hand lay outside the bounding
 box of what they kept -- and not one kept splat lay outside it. That
 boundary is exact, unlike the in-box removals, which the operator reports
-vary per vehicle and which no per-splat feature predicts (max_axis reaches
+vary per subject and which no per-splat feature predicts (max_axis reaches
 4% precision, distance to the surveyed cloud 16%).
 
 Position anchoring barely touches this. Of the 36,999 surveyed rows removed

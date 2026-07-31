@@ -187,11 +187,21 @@ n=1 対 n=1 は何も言わない。**各アーム 2 本**が最低条件。実�
 
 ### プラグイン設置の注意
 
+- **`pyproject.toml` を編集したら `.venv/.deps_installed` を touch し直すこと。**
+  プラグインローダは「pyproject の mtime > マーカーの mtime」で依存の再同期を
+  試み、**ソースビルドは uv を同梱しないため必ず `uv not found` でロード失敗**
+  し、パネルが 1 枚も出なくなる（2026-07-31 に v0.4.0 のバージョンスタンプで
+  実際に踏んだ。ログは `Plugin autoload: 1 plugin(s)` → `load(...) failed`）。
+  恒久対策としてローダの探索先 `src/python/bin/uv.exe` に `build/bin/uv.exe` を
+  コピー済み — ただしビルドツリーを作り直したら再コピーが要る。再同期が走ると
+  `uv.lock` がリポジトリ直下にできるため `.gitignore` 済み
+
 - プラグインの `settings.json` に BOM を付けない（PowerShell 5.1 の
   `Set-Content -Encoding utf8` は BOM 付きになり無視される）
-- **`load_on_startup: true` と `--python-script` を併用しない。** `AnchorRegularizer` が
-  二重登録されうる（両方が `LFS_MPC_ENABLED` を読む）。バッチは `--python-script`
-  単独経路に一本化する。開発中はリポジトリを
+- ~~`load_on_startup: true` と `--python-script` を併用しない~~ **1.0.1 で併用可能に
+  なった。** `headless_anchor.py` がロード済みプラグインを検出するとその
+  regularizer を再利用しフックを張らないため、`AnchorRegularizer` の二重登録は
+  起きない（`mpc_tests/test_headless_guard.py` で固定）。開発中はリポジトリを
   `~/.lichtfeld/plugins/maintain_pointcloud` に junction すると編集が即反映される。
 - **uv がプロキシ経由で壊れたホイールをキャッシュすることがある**
   （`The wheel is invalid: Metadata field Name not found` がリトライしても再現）。

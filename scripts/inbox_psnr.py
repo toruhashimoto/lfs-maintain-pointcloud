@@ -16,7 +16,7 @@ evaluation renders the entire photograph, background included, and the box
 deliberately starves everything outside it (Adam step x0.1, pixel loss
 x0.1). Those background splats are not junk to the renderer; they are what
 the training photographs actually contain. The operator removes them
-because the DELIVERABLE is the vehicle, not the scene.
+because the DELIVERABLE is the subject, not the scene.
 
 So the full-frame score and the cleanup score pull in opposite directions
 by construction, and neither alone can say whether cropping is a good idea.
@@ -26,7 +26,7 @@ ships.
 Method: project the eight corners of the crop box into each hold-out
 camera, take the axis-aligned 2D hull of that projection clipped to the
 frame, and score only those pixels. The 2D hull of a 3D box overestimates
-the vehicle's silhouette, so this is conservative -- it still includes some
+the subject's silhouette, so this is conservative -- it still includes some
 background, which biases the comparison TOWARD the uncropped arms.
 
 The eval images are GT and render side by side (two panels of the camera's

@@ -5,3 +5,6 @@ settings.json
 uv.lock
 *.log
 .claude/
+.sanitize/
+/settings.json
+/uv.lock

@@ -16,7 +16,7 @@ cleanly in two:
   * 57,238 (74.8%) lay outside the bounding box of the kept model, and NOT
     ONE kept splat lay outside it. That boundary is exact.
   * 19,292 (25.2%) lay inside the box. Those are excluded from the score:
-    the operator reports the in-box criterion varies per vehicle, so it is
+    the operator reports the in-box criterion varies per subject, so it is
     a judgement rather than a rule, and per-splat features cannot stand in
     for it anyway (max_axis > 0.01 catches 55% at 4% precision, distance to
     the surveyed cloud reaches only 16% precision).

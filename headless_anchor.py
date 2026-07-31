@@ -60,25 +60,37 @@ if _missing:
         "the plugin venv or ~/.lichtfeld/venv before trusting this run."
     )
 
-reg = AnchorRegularizer()
-reg.enabled = True  # headless default: on (override with LFS_MPC_ENABLED=0)
-apply_env_overrides(reg)
-lf.log.info("[maintain_pointcloud/headless] config: " + json.dumps(reg.config_dict()))
+# Plugins load BEFORE --python-script runs. If the installed plugin is
+# already active (load_on_startup: true for GUI use), registering a second
+# regularizer here would pull every splat twice per iteration -- so reuse
+# the plugin's instance and let its ScopedHandler keep owning the hooks.
+_plugin = sys.modules.get("maintain_pointcloud")
+_plugin_reg = getattr(_plugin, "regularizer", None) if _plugin else None
 
+if _plugin_reg is not None:
+    reg = _plugin_reg
+    reg.enabled = True  # headless default: on (override with LFS_MPC_ENABLED=0)
+    apply_env_overrides(reg)
+    lf.log.info(
+        "[maintain_pointcloud/headless] plugin already loaded; reusing its "
+        "regularizer (no extra hooks). config: " + json.dumps(reg.config_dict()))
+else:
+    reg = AnchorRegularizer()
+    reg.enabled = True  # headless default: on (override with LFS_MPC_ENABLED=0)
+    apply_env_overrides(reg)
+    lf.log.info("[maintain_pointcloud/headless] config: "
+                + json.dumps(reg.config_dict()))
 
-@lf.on_training_start
-def _on_start(hook):
-    reg.on_training_start(hook)
+    @lf.on_training_start
+    def _on_start(hook):
+        reg.on_training_start(hook)
 
+    @lf.on_post_step
+    def _on_post_step(hook):
+        reg.apply(hook)
 
-@lf.on_post_step
-def _on_post_step(hook):
-    reg.apply(hook)
+    @lf.on_training_end
+    def _on_end(hook):
+        reg.on_training_end(hook)
 
-
-@lf.on_training_end
-def _on_end(hook):
-    reg.on_training_end(hook)
-
-
-lf.log.info("[maintain_pointcloud/headless] hooks registered")
+    lf.log.info("[maintain_pointcloud/headless] hooks registered")

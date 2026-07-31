@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.0.1 (2026-08-03)
+
+Input Crop パネルの GUI 実機検証で見つかった問題の修正。パネル表示・箱の
+配置・調整（ギズモ/数値）までは実機で確認済み。Export → クロップ済み学習の
+一巡は次回の実用検証で行う。
+
+### fix: プラグインがロードされない（`uv not found`）
+
+`pyproject.toml` の mtime が `.venv/.deps_installed` より新しいと、ローダが
+依存の再同期を試みる。**ソースビルドの LichtFeld は uv を同梱せず、システム
+uv も設計上拒否するため、この経路は必ず失敗し、パネルが 1 枚も出なくなる**
+（v0.4.0 のバージョンスタンプ自体が引き金だった）。対処と恒久策（ローダ
+探索先への uv 配置）は HANDOFF「プラグイン設置の注意」。
+
+### fix: Input Crop の箱が調整できない
+
+エンジンのクロップ箱ギズモは**選択駆動**（NodeSelected ハンドラが
+`builtin.cropbox` ツールを起動する）で、パネルは箱を作るだけで選択して
+いなかった。Seed / Fit 直後に `lf.select_node()` で自動選択し、その場で
+ドラッグできるようにした。
+
+### 追加: 箱のリサイズ操作系（SuperSplat 相当）
+
+- **Move (gizmo) / Scale (gizmo)** ボタン — `lf.ui.set_active_operator` で
+  ギズモ種別を直接切替（メインツールバーの移動/スケールと同じ経路）
+- **Center + Size** の数値表現を min/max と併設。書き込みは箱の min/max
+  データへ直行するため、**書き出しと必ず一致する**
+- **Shrink 5% / Expand 5%**（中心固定の等比）
+- ギズモのドラッグが反映されているかはパネル数値の追従で確認できる旨を明記
+
+### fix: GUI プラグインと `--python-script` の二重登録ガード
+
+`load_on_startup: true`（GUI 設置）とキャンペーンの `--python-script` を
+併用すると AnchorRegularizer が二重登録され毎 iteration 二重に引かれる。
+`headless_anchor.py` がロード済みプラグインを検出したらその regularizer を
+再利用しフックを張らないようにした（env 設定経路は維持）。テスト +2 本で
+**132 本**。
+
 ## 1.0.0 (2026-08-01)
 
 最初の安定版。**コードは 0.4.0 と同一**で、位置アンカー・入力クロップの両機能と
