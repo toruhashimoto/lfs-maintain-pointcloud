@@ -155,3 +155,25 @@ if __name__ == "__main__":
         fn()
         print(f"PASS {fn.__name__}")
     print(f"{len(fns)} tests passed")
+
+
+def test_control_rows_are_never_pulled():
+    # Control rows estimate the FREE drift distribution. If any setting
+    # could pull them, the calibration input would be measuring the leash's
+    # own output and the feedback loop would collapse the dead zone.
+    means = np.array([[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    anchors = np.zeros((2, 3))
+    control = np.array([[0.0], [1.0]])
+    out = anchor_pull(means, anchors, _ones_mask(2), strength=1.0,
+                      control=control)
+    assert not np.allclose(out[0], means[0])      # normal row moved
+    np.testing.assert_allclose(out[1], means[1])  # control row untouched
+
+
+def test_control_none_matches_zero_control():
+    means = np.array([[3.0, 4.0, 0.0]])
+    anchors = np.zeros((1, 3))
+    a = anchor_pull(means, anchors, _ones_mask(1), strength=0.5)
+    b = anchor_pull(means, anchors, _ones_mask(1), strength=0.5,
+                    control=np.zeros((1, 1)))
+    np.testing.assert_allclose(a, b)

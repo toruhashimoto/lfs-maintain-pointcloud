@@ -84,3 +84,29 @@ if __name__ == "__main__":
         fn()
         print(f"PASS {fn.__name__}")
     print(f"{len(fns)} tests passed")
+
+
+def test_reports_bounded_tail_percentiles():
+    # The maximum is one row's value and is useless for inference: measured
+    # baselines were 10.879 / 11.023 / 11.408 / 41.405 / 79.971 / 93.861 --
+    # bimodal, 9x spread, effect/noise 1.0 even with six runs. p99/p99.9 are
+    # bounded versions of the same tail that a mean and stdev can describe.
+    d = np.arange(1001, dtype=np.float64)   # 0..1000, k-th pct is k*10
+    s = drift_percentiles(d)
+    # np.percentile interpolates, so p99.9 lands on 999.0000000000001 --
+    # compare with a tolerance rather than pinning the float.
+    assert np.isclose(s["p99"], 990.0)
+    assert np.isclose(s["p999"], 999.0)
+
+
+def test_tail_percentiles_stay_monotonic():
+    rng = np.random.default_rng(7)
+    d = rng.lognormal(mean=0.0, sigma=2.0, size=100000)
+    s = drift_percentiles(d)
+    assert s["p95"] <= s["p99"] <= s["p999"] <= s["max"]
+
+
+def test_tail_percentiles_present_on_empty_and_single():
+    for d in (np.array([], dtype=np.float64), np.array([2.5])):
+        s = drift_percentiles(d)
+        assert "p99" in s and "p999" in s

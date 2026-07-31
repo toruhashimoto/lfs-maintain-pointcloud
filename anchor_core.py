@@ -78,9 +78,25 @@ import lichtfeld as lf
 try:  # package import (plugin) vs. flat import (--python-script)
     from .stats_policy import should_snapshot
     from .drift_stats import drift_percentiles
+    from .calibration import (
+        calibrate_free_radius, control_quantiles, escape_counts,
+        select_control_rows)
+    from .shape_stats import scale_stats
+    from .anchor_policy import new_row_mask_fill, nn_retarget_enables_rows
+    from .cropbox import pad_box, parse_box
+    from .split_detect import SPLIT_LOG_VOLUME_DELTA
+    from .tail_diag import tail_diagnostics
 except ImportError:  # pragma: no cover - exercised by headless_anchor.py
     from stats_policy import should_snapshot
     from drift_stats import drift_percentiles
+    from calibration import (
+        calibrate_free_radius, control_quantiles, escape_counts,
+        select_control_rows)
+    from shape_stats import scale_stats
+    from anchor_policy import new_row_mask_fill, nn_retarget_enables_rows
+    from cropbox import pad_box, parse_box
+    from split_detect import SPLIT_LOG_VOLUME_DELTA
+    from tail_diag import tail_diagnostics
 
 _EPS = 1e-12
 _BIG = 1e30
@@ -90,6 +106,11 @@ _RELOC_MIN_OPACITY = 0.02   # positional jumps only count for rows this alive
 _REVIVE_FROM = 0.02         # dead->alive opacity discontinuity: below this...
 _REVIVE_TO = 0.10           # ...to above this in one step = relocation
 _MASS_TELEPORT_FRACTION = 0.05  # more than this fraction -> whole-model event
+
+# Absolute slack on the split's log-volume signature. Has to cover the
+# optimiser step applied in the same iteration, while staying far away from
+# anything scaling_lr alone can produce (a full nat is out of its reach).
+_SPLIT_TOL = 0.05
 
 
 def apply_env_overrides(reg):
@@ -146,6 +167,17 @@ def apply_env_overrides(reg):
     reg.stats_out = os.environ.get("LFS_MPC_STATS_OUT", reg.stats_out)
     reg.stats_snapshot_every = _i("LFS_MPC_SNAPSHOT_EVERY",
                                   reg.stats_snapshot_every)
+    reg.calibrate = _b("LFS_MPC_CALIBRATE", reg.calibrate)
+    reg.control_fraction = _f("LFS_MPC_CONTROL_FRACTION", reg.control_fraction)
+    reg.calibrate_quantile = _f("LFS_MPC_CALIB_Q", reg.calibrate_quantile)
+    reg.calibrate_every = _i("LFS_MPC_CALIB_EVERY", reg.calibrate_every)
+    reg.calibrate_start = _i("LFS_MPC_CALIB_START", reg.calibrate_start)
+    reg.calibrate_seed = _i("LFS_MPC_CALIB_SEED", reg.calibrate_seed)
+    reg.calibrate_min_spacing = _f("LFS_MPC_CALIB_MIN_SPACING",
+                                   reg.calibrate_min_spacing)
+    reg.reanchor_on_split = _b("LFS_MPC_REANCHOR_SPLIT", reg.reanchor_on_split)
+    reg.crop_box = os.environ.get("LFS_MPC_CROP_BOX", reg.crop_box)
+    reg.crop_box_pad = _f("LFS_MPC_CROP_BOX_PAD", reg.crop_box_pad)
     return reg
 
 
@@ -228,6 +260,69 @@ class AnchorRegularizer:
         # makes the last successful write the final result. 0 disables it.
         self.stats_snapshot_every = 1000
 
+        # --- self-calibrating dead zone (opt-in) -----------------------------
+        # The dead zone decides whether the leash acts at all. Measured on
+        # this dataset, a zone above the free-drift p95 produced zero effect
+        # on every percentile, while the same run with the zone at p75 moved
+        # p90 -25.6% and p95 -38.3%. Expressed as a spacing multiple the two
+        # datasets studied so far disagree (2.0 vs 1.0); expressed as a drift
+        # percentile they agree. The spacing rule cannot know which side of
+        # the distribution it lands on, so calibration measures it instead.
+        # Default off: a default is not moved on the strength of one dataset.
+        self.calibrate = False
+        # Fraction of the initial rows held out from the pull entirely. These
+        # carry the free-drift estimate -- in an anchored run they are the
+        # only rows whose displacement is not the leash's own output.
+        self.control_fraction = 0.02
+        # Quantile of the control drift used as the dead zone. Every
+        # candidate is recorded per snapshot so this can be chosen post hoc.
+        # 60 since 2026-07-31 (was 70): two datasets agree the sweep is
+        # monotone -- q60 takes drift p95 a further 7-12% down vs q70 for
+        # +0.8pt of scale_p90 and no photometric cost, which is the right
+        # trade for a plugin whose stated job is position fidelity. q50 is
+        # deliberately NOT the default: its shape-cost increment is double,
+        # C shows the first statistically visible SSIM deficit vs q70
+        # (effect/noise 5.0), and it sits on the edge of the swept range.
+        self.calibrate_quantile = 60.0
+        self.calibrate_every = 500
+        # Before this the distribution is far too young to extrapolate from:
+        # at 1,500 iters this dataset's p95 was 0.16x its 30,000-iter value.
+        self.calibrate_start = 1000
+        self.calibrate_seed = 0
+        # Floor as a multiple of nn_spacing. A zero dead zone with a fixed
+        # strength is the documented hard-freeze failure mode.
+        self.calibrate_min_spacing = 0.25
+
+        # Re-anchor a row at its post-split position when MRNF splits it
+        # along its long axis. The split displaces the parent and halves
+        # that axis; the displacement is far below the teleport threshold,
+        # so without this the anchor reels the parent back to the pre-split
+        # centre while the axis stays halved, the pair stops tiling the
+        # extent it was split to cover, and the unregularised scaling_lr
+        # regrows that axis. That is the measured scale inflation, and it
+        # grows monotonically as the leash tightens (+2.1% / +2.9% / +3.4%
+        # of scale_p90 at q70 / q60 / q50).
+        #
+        # Off by default because it is a TRADE, not a fix: accepting the
+        # displacement means the anchor moves by exp(scale_long)*0.5 every
+        # time a row splits, which is drift the plugin exists to prevent.
+        # Both sides are measured -- split rows keep _orig = 1 so their
+        # displacement still shows up in init_drift.
+        self.reanchor_on_split = False
+
+        # Training region of interest, "x0,y0,z0:x1,y1,z1" in world units.
+        # 74.8% of what the operator removed by hand on the C capture lay
+        # outside the box of what they kept, and not one kept splat lay
+        # outside it. The engine already de-weights splats a crop box
+        # rejects (cropbox_lr_scale 0.1, cropbox_loss_weight 0.1) but only
+        # exposes those scales, not the box. Empty = leave the scene alone.
+        self.crop_box = ""
+        # The delivered box is only known after delivery, so a box set in
+        # advance is nominal. Measured: cropping C's cloud to the
+        # delivered box exactly drops 29,175 surveyed points, with 5%
+        # padding 17,857.
+        self.crop_box_pad = 0.05
+
         # --- cross-thread request flags (set by UI, serviced in apply()) -----
         self._reset_requested = False
         self._capture_requested = False
@@ -253,6 +348,12 @@ class AnchorRegularizer:
         #                               from (recorded even on failed loads)
         self._last_nn_iter = -1
         self._last_snapshot_it = -1   # iteration of the last stats file write
+        self._control = None      # [N,1] lf.Tensor, 1.0 = held out from pull
+        self._calibrated_radius = 0.0  # 0 = not calibrated yet
+        self._last_calib_it = -1
+        self._radius_history = []      # [(iter, radius), ...] audit trail
+        self._prev_scale_sum = None    # [N,1] sum of raw log scales
+        self._crop_box_applied = None  # the box actually pushed to the scene
 
         # --- read-only stats (panel display) ----------------------------------
         self.stat_iter = 0
@@ -261,6 +362,7 @@ class AnchorRegularizer:
         self.stat_anchored_rows = 0
         self.stat_rows = 0
         self.stat_teleports = 0
+        self.stat_splits = 0
         self.stat_appended = 0
         self.stat_applied_iters = 0
         self.stat_errors = 0
@@ -291,6 +393,13 @@ class AnchorRegularizer:
         self._ref_built_from = None
         self._last_nn_iter = -1
         self._last_snapshot_it = -1
+        self._control = None
+        self._calibrated_radius = 0.0
+        self._last_calib_it = -1
+        self._radius_history = []
+        self._prev_scale_sum = None
+        self._crop_box_applied = None
+        self.stat_splits = 0
         self.stat_teleports = 0
         self.stat_appended = 0
         self.stat_applied_iters = 0
@@ -341,8 +450,32 @@ class AnchorRegularizer:
         return float(np.median(d[:, 1]))
 
     def _effective_free_radius(self):
-        """User value if set, else the spacing-derived dead zone."""
-        return self.free_radius if self.free_radius > 0.0 else self._auto_free_radius
+        """User value if set, else the calibrated one, else the spacing rule.
+
+        An explicit free_radius always wins: an operator who set a number
+        meant that number, and silently overriding it would make the
+        calibration invisible in exactly the runs someone is trying to pin
+        down by hand.
+        """
+        if self.free_radius > 0.0:
+            return self.free_radius
+        if self.calibrate and self._calibrated_radius > 0.0:
+            return self._calibrated_radius
+        return self._auto_free_radius
+
+    def _scale_sum(self):
+        """[N,1] sum of the three raw (log) scales, i.e. log-volume.
+
+        None when the model is unavailable or scaling cannot be read, which
+        makes split detection skip rather than fail.
+        """
+        m = self._model()
+        if m is None:
+            return None
+        try:
+            return m.scaling_raw.sum(dim=1, keepdim=True)
+        except Exception:
+            return None
 
     def _teleport_thresh(self):
         if self.teleport_threshold > 0.0:
@@ -362,6 +495,70 @@ class AnchorRegularizer:
             s *= max(0.0, min(1.0, ramp))
         return s
 
+    # --------------------------------------------------------------- cropbox
+    def _apply_crop_box(self):
+        """Push the configured region of interest onto the scene, once.
+
+        The engine then scales the Adam step of splats the box rejects by
+        `cropbox_lr_scale` (default 0.1) and the pixel loss for rays that
+        miss it by `cropbox_loss_weight` (0.1), so geometry has far less
+        reason to grow out there in the first place. Only those two scales
+        are CLI parameters; the box is a scene node, which is why this has
+        to reach into the scene rather than set a training option.
+
+        Failure is logged and swallowed: an unusable box must not take the
+        run down, and `crop_box_applied` stays None so the stats file shows
+        it never took effect.
+        """
+        if self._crop_box_applied is not None or not self.crop_box:
+            return
+        try:
+            box = pad_box(parse_box(self.crop_box), self.crop_box_pad)
+        except ValueError as e:
+            lf.log.error(f"[maintain_pointcloud] bad crop_box: {e}")
+            self.crop_box = ""      # do not retry every iteration
+            return
+        if box is None:
+            return
+        lo, hi = box
+        try:
+            scene = lf.get_scene()
+            splat_id = None
+            for node in scene.get_nodes():
+                try:
+                    if node.splat_data() is not None:
+                        splat_id = node.id
+                        break
+                except Exception:
+                    continue
+            if splat_id is None:
+                lf.log.error(
+                    "[maintain_pointcloud] crop_box: no splat node in the "
+                    "scene; box not applied")
+                self.crop_box = ""
+                return
+            cb_id = scene.get_or_create_cropbox_for_splat(splat_id)
+            cb = scene.get_cropbox_data(cb_id)
+            # These take a TUPLE. A list raises RuntimeError('bad cast').
+            cb.set("min", tuple(float(v) for v in lo))
+            cb.set("max", tuple(float(v) for v in hi))
+            cb.set("inverse", False)
+            cb.set("enabled", True)
+            scene.set_cropbox_data(cb_id, cb)
+            back = scene.get_cropbox_data(cb_id)
+            self._crop_box_applied = {"min": list(back.get("min")),
+                                      "max": list(back.get("max")),
+                                      "enabled": bool(back.get("enabled")),
+                                      "cropbox_id": int(cb_id)}
+            lf.log.info(
+                f"[maintain_pointcloud] crop box applied to splat {splat_id}: "
+                f"min {self._crop_box_applied['min']} "
+                f"max {self._crop_box_applied['max']} "
+                f"(pad {self.crop_box_pad:.3f})")
+        except Exception as e:
+            lf.log.error(f"[maintain_pointcloud] crop box failed: {e!r}")
+            self.crop_box = ""
+
     # ---------------------------------------------------------------- capture
     def _capture(self, means, opacity_raw, it=0, initial=True):
         n = means.shape[0]
@@ -369,10 +566,34 @@ class AnchorRegularizer:
         self._anchor0 = means.clone()
         self._prev = means.clone()
         self._prev_op = opacity_raw.clone() if opacity_raw is not None else None
+        self._prev_scale_sum = self._scale_sum()
         self._n = n
         self._n0 = n
         self._mask = lf.Tensor.ones([n, 1], device="cuda", dtype="float32")
         self._orig = lf.Tensor.ones([n, 1], device="cuda", dtype="float32")
+        # Control rows: held out from the pull for the whole run so their
+        # displacement stays a free-drift sample. Folding them into _mask
+        # rather than gating apply() means the existing `pull * self._mask`
+        # already excludes them -- the pull math itself is untouched.
+        self._control = lf.Tensor.zeros([n, 1], device="cuda", dtype="float32")
+        if self.calibrate and self.control_fraction > 0.0:
+            try:
+                sel = select_control_rows(
+                    n, self.control_fraction, self.calibrate_seed)
+                if sel.any():
+                    self._control = lf.Tensor.from_numpy(
+                        sel.astype("float32").reshape(n, 1)).cuda()
+                    self._mask = self._mask - self._control
+            except Exception as e:
+                # Degrade to "no calibration" rather than to a silently
+                # miscalibrated leash: without control rows _maybe_calibrate
+                # finds an empty sample and keeps the static dead zone.
+                self._control = lf.Tensor.zeros(
+                    [n, 1], device="cuda", dtype="float32")
+                lf.log.error(
+                    f"[maintain_pointcloud] control-row selection failed: "
+                    f"{e!r}; calibration will not run this session"
+                )
         if not initial:
             self._baseline_valid = False
             self._recaptured_at = it
@@ -406,7 +627,8 @@ class AnchorRegularizer:
             f"nn spacing ~{self._nn_spacing:.5f}, "
             f"free radius {self._effective_free_radius():.5f}"
             f"{' (auto)' if self.free_radius <= 0.0 else ''}, "
-            f"teleport thresh {self._teleport_thresh():.4f}"
+            f"teleport thresh {self._teleport_thresh():.4f}, "
+            f"control rows {int(self._control.sum_scalar())}"
             + ("" if initial else f" (RE-capture at iter {it}; init-drift "
                f"baseline no longer refers to training start)")
         )
@@ -433,9 +655,11 @@ class AnchorRegularizer:
         # exception, OOM during a growth append), buffers may disagree.
         # A corrupt state is unrecoverable row-wise -> full re-capture.
         if (self._anchor is None or self._mask is None or self._orig is None
+                or self._control is None
                 or self._anchor.shape[0] != self._n
                 or self._mask.shape[0] != self._n
-                or self._orig.shape[0] != self._n):
+                or self._orig.shape[0] != self._n
+                or self._control.shape[0] != self._n):
             lf.log.warn(
                 "[maintain_pointcloud] internal state inconsistent "
                 "(interrupted update?); re-capturing anchors"
@@ -457,13 +681,19 @@ class AnchorRegularizer:
             new_rows = means[self._n:n_now]
             grown_n = n_now - self._n
             self._anchor = lf.Tensor.cat([self._anchor, new_rows.clone()], dim=0)
-            fill = 1.0 if self.anchor_new_splats else 0.0
+            fill = new_row_mask_fill(self.anchor_new_splats, self.mode)
             self._mask = lf.Tensor.cat(
                 [self._mask,
                  lf.Tensor.full([grown_n, 1], fill, device="cuda", dtype="float32")],
                 dim=0)
             self._orig = lf.Tensor.cat(
                 [self._orig,
+                 lf.Tensor.zeros([grown_n, 1], device="cuda", dtype="float32")],
+                dim=0)
+            # Appended rows are never controls: the control set has to stay a
+            # sample of the INITIAL cloud for its drift to mean anything.
+            self._control = lf.Tensor.cat(
+                [self._control,
                  lf.Tensor.zeros([grown_n, 1], device="cuda", dtype="float32")],
                 dim=0)
             if self._prev is not None:
@@ -522,7 +752,7 @@ class AnchorRegularizer:
         tele3 = tele.expand([n_now, 3])
         # Re-anchor relocated rows at their new birth position.
         self._anchor = lf.Tensor.where(tele3, means, self._anchor)
-        fill = 1.0 if self.anchor_new_splats else 0.0
+        fill = new_row_mask_fill(self.anchor_new_splats, self.mode)
         self._mask = lf.Tensor.where(
             tele,
             lf.Tensor.full([n_now, 1], fill, device="cuda", dtype="float32"),
@@ -531,7 +761,51 @@ class AnchorRegularizer:
         self._orig = lf.Tensor.where(
             tele, lf.Tensor.zeros([n_now, 1], device="cuda", dtype="float32"),
             self._orig)
+        # A relocated slot no longer holds its original init point, so it is
+        # no longer a valid free-drift sample either. Note the mask assignment
+        # above already cleared its exemption, which is harmless: the row is
+        # not measured as a control any more.
+        self._control = lf.Tensor.where(
+            tele, lf.Tensor.zeros([n_now, 1], device="cuda", dtype="float32"),
+            self._control)
         self.stat_teleports += n_tele
+
+    def _sync_splits(self, means, it):
+        """Re-anchor rows MRNF split along their long axis this iteration.
+
+        Mirrors split_detect.detect_long_axis_splits with tensor ops (that
+        module is the tested reference; doing it there would cost a ~32 MB
+        host transfer every iteration at 8M rows).
+
+        `_orig` is deliberately left at 1 for these rows. They still stand
+        for their original init point, so the displacement the split applied
+        must keep showing up in init_drift -- this is a trade between
+        position and shape fidelity, and hiding one side of it from the
+        measurement would make the trade look free.
+        """
+        if not self.reanchor_on_split:
+            return
+        cur = self._scale_sum()
+        if cur is None:
+            return
+        n_now = means.shape[0]
+        if (self._prev_scale_sum is None
+                or self._prev_scale_sum.shape[0] != n_now
+                or cur.shape[0] != n_now):
+            self._prev_scale_sum = cur
+            return
+        delta = cur - self._prev_scale_sum                       # [N,1]
+        lo = SPLIT_LOG_VOLUME_DELTA - _SPLIT_TOL
+        hi = SPLIT_LOG_VOLUME_DELTA + _SPLIT_TOL
+        split_f = (self._bool_f(delta > lo, n_now)
+                   * self._bool_f(delta < hi, n_now))
+        n_split = int(split_f.sum_scalar())
+        self._prev_scale_sum = cur
+        if n_split == 0:
+            return
+        split3 = (split_f > 0.5).expand([n_now, 3])
+        self._anchor = lf.Tensor.where(split3, means, self._anchor)
+        self.stat_splits += n_split
 
     # ------------------------------------------------------------------ nn mode
     def _ensure_reference(self):
@@ -589,6 +863,17 @@ class AnchorRegularizer:
         _dist, idx = self._kdtree.query(mu, workers=-1)
         target = self._ref_np[idx]  # [N,3] float32
         self._anchor = lf.Tensor.from_numpy(target).cuda()
+        n = self._anchor.shape[0]
+        if nn_retarget_enables_rows(self.anchor_new_splats):
+            # Every row now has a reference-cloud anchor, so the exemption
+            # new_row_mask_fill() applied on arrival is no longer needed --
+            # that exemption exists only to stop a row being pulled toward
+            # its birth position in the window before this runs. Control
+            # rows stay exempt: they carry the free-drift estimate.
+            mask = lf.Tensor.ones([n, 1], device="cuda", dtype="float32")
+            if self._control is not None and self._control.shape[0] == n:
+                mask = mask - self._control
+            self._mask = mask
         self._last_nn_iter = it
 
     # ------------------------------------------------------------------- apply
@@ -623,6 +908,11 @@ class AnchorRegularizer:
             self._capture(means, opacity_raw, it, initial=False)
             return
 
+        # Independent of anchoring: the box is a training-side lever and has
+        # to be in force from the first iteration whether or not the leash
+        # is enabled, so a baseline arm can use it too.
+        self._apply_crop_box()
+
         if self._anchor is None:
             self._capture(means, opacity_raw, it)
             return
@@ -630,7 +920,6 @@ class AnchorRegularizer:
         # Snapshot panel-tunable scalars once (the UI thread may edit them
         # between any two statements below).
         strength_s = self._strength_at(it)
-        free_radius = self._effective_free_radius()
         huber_delta = self.huber_delta
         max_distance = self.max_distance
         min_pull_op = self.min_pull_opacity
@@ -640,8 +929,15 @@ class AnchorRegularizer:
 
         try:
             self._sync_topology(means, opacity_raw, it)
+            self._sync_splits(means, it)
             if self.mode == "nn":
                 self._nn_retarget(means, it)
+
+            # Calibrate before reading the radius: this is the one place the
+            # dead zone can change mid-run, and every consumer below has to
+            # see the same value within a single iteration.
+            self._maybe_calibrate(it)
+            free_radius = self._effective_free_radius()
 
             # Before the zero-strength early return below: a baseline run
             # (enabled=False) still has to produce drift statistics, since
@@ -737,10 +1033,16 @@ class AnchorRegularizer:
                            "final": final,
                            "applied_iters": self.stat_applied_iters,
                            "teleports": self.stat_teleports,
+                           "splits_reanchored": self.stat_splits,
                            "appended": self.stat_appended,
                            "errors": self.stat_errors,
                            "config": self.config_dict(),
-                           "init_drift": stats}, f, indent=2)
+                           "free_radius_history": list(self._radius_history),
+                           "init_drift": stats,
+                           "control_drift": self.control_drift_stats(),
+                           "visible_drift": self._visible_drift(),
+                           "scale": self.shape_stats(),
+                           "tail_diag": self.tail_diag_stats()}, f, indent=2)
             return True
         except OSError as e:
             lf.log.error(f"[maintain_pointcloud] stats write failed: {e}")
@@ -790,11 +1092,139 @@ class AnchorRegularizer:
         if out and stats is not None:
             self._write_stats(out, stats, self.stat_iter, final=True)
 
+    # ------------------------------------------------------------ calibration
+    def _visible_drift(self):
+        """Drift of the anchored rows the leash actually acts on.
+
+        `min_pull_opacity` exempts near-transparent rows from the pull by
+        design: they are invisible, MCMC noise moves them freely, and
+        pulling them only fights the relocation machinery. Measured at 16M
+        cap, 31 and 32 of the 32 largest drifters were below that gate,
+        with opacities of 0.004-0.009 -- so the extreme tail of init_drift
+        consists almost entirely of rows the plugin deliberately never
+        touches, and rows that contribute nothing to a render.
+
+        That also means `escaped_2x` = 25 on a calibrated run was counting
+        essentially those same rows. This variant reports the tail over the
+        rows the leash is responsible for. It is reported ALONGSIDE the
+        unfiltered figures, never instead of them: the published tables use
+        the unfiltered ones and have to stay comparable.
+        """
+        m = self._model()
+        if m is None or self._anchor0 is None or self._n0 == 0:
+            return None
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        try:
+            n0 = min(self._n0, m.means_raw.shape[0])
+            mu = m.means_raw[0:n0].numpy(copy=True).reshape(-1, 3)
+            a0 = self._anchor0[0:n0].numpy(copy=True).reshape(-1, 3)
+            keep = self._orig[0:n0].numpy(copy=True).reshape(-1) > 0.5
+            if self._control is not None:
+                keep &= ~(self._control[0:n0].numpy(copy=True).reshape(-1) > 0.5)
+            op = m.opacity_raw[0:n0].numpy(copy=True).reshape(-1)
+            keep &= (1.0 / (1.0 + np.exp(-op))) >= self.min_pull_opacity
+            if not keep.any():
+                return None
+            d = np.linalg.norm(mu[keep] - a0[keep], axis=1)
+        except Exception as e:
+            lf.log.error(f"[maintain_pointcloud] visible drift failed: {e!r}")
+            return None
+        out = {"rows": int(d.size),
+               "min_pull_opacity": float(self.min_pull_opacity)}
+        out.update(drift_percentiles(d))
+        out.update(escape_counts(d, self._nn_spacing))
+        return out
+
+    def _drift_split(self):
+        """(anchored_drift, control_drift) over surviving original rows.
+
+        One GPU->CPU transfer serves both: at 8M rows each copy is ~95 MB,
+        and the two consumers (the stats snapshot and the calibration) run
+        on different cadences, so doing it once per call rather than once
+        per consumer halves the traffic.
+
+        Rows whose slot was reused by an MCMC relocation are excluded from
+        both -- they would report the relocation distance, not drift.
+
+        Returns (None, None) when there is nothing to measure yet.
+        """
+        m = self._model()
+        if m is None or self._anchor0 is None or self._n0 == 0:
+            return None, None
+        try:
+            import numpy as np
+        except ImportError:
+            return None, None
+        n0 = min(self._n0, m.means_raw.shape[0])
+        mu = m.means_raw[0:n0].numpy(copy=True).reshape(-1, 3)
+        a0 = self._anchor0[0:n0].numpy(copy=True).reshape(-1, 3)
+        orig = self._orig[0:n0].numpy(copy=True).reshape(-1) > 0.5
+        d_all = np.linalg.norm(mu - a0, axis=1)
+        if self._control is None:
+            return d_all[orig], np.empty(0)
+        ctl = self._control[0:n0].numpy(copy=True).reshape(-1) > 0.5
+        return d_all[orig & ~ctl], d_all[orig & ctl]
+
+    def _maybe_calibrate(self, it):
+        """Re-derive the dead zone from the control rows' drift quantile.
+
+        Contained like _maybe_snapshot_stats: a failure here must not unwind
+        into apply()'s error path, which would drop this iteration's
+        teleport snapshots.
+        """
+        if not self.calibrate or self._control is None:
+            return
+        if self.free_radius > 0.0:
+            return                      # explicit value always wins
+        if it < self.calibrate_start:
+            return
+        if (self._last_calib_it >= 0
+                and it - self._last_calib_it < max(1, self.calibrate_every)):
+            return
+        # Set before doing the work: a persistent failure must not retry on
+        # every single iteration.
+        self._last_calib_it = it
+        try:
+            _anchored, ctl = self._drift_split()
+            if ctl is None or ctl.size == 0:
+                return
+            r_static = self.free_radius_spacing * self._nn_spacing
+            prev = self._effective_free_radius()
+            r_new = calibrate_free_radius(
+                ctl,
+                self.calibrate_quantile,
+                r_static=r_static,
+                r_min=self.calibrate_min_spacing * self._nn_spacing,
+                current=prev,
+            )
+            if r_new is None:
+                return
+            self._calibrated_radius = r_new
+            self._radius_history.append((int(it), float(r_new)))
+            lf.log.info(
+                f"[maintain_pointcloud] dead zone calibrated at iter {it}: "
+                f"{prev:.6f} -> {r_new:.6f} "
+                f"(control q{self.calibrate_quantile:g} of {ctl.size} rows, "
+                f"static bound {r_static:.6f})"
+            )
+        except Exception as e:
+            lf.log.error(
+                f"[maintain_pointcloud] calibration failed at iter {it}: {e!r}")
+
     # ------------------------------------------------------------- measurement
     def init_drift_stats(self):
         """Displacement of the original init rows from their captured
         positions, EXCLUDING rows whose slot was reused by an MCMC
-        relocation (those would report the relocation distance, not drift).
+        relocation (those would report the relocation distance, not drift)
+        and EXCLUDING the held-out control rows.
+
+        Control rows are reported separately by control_drift_stats(). Mixing
+        them in would contaminate precisely the upper tail the leash is meant
+        to be clamping: they are chosen to be free, so they land in it by
+        construction.
 
         Returns a dict with mean/median/p95/max drift over the surviving
         original rows, coverage counts, and a baseline_valid flag (False
@@ -808,18 +1238,23 @@ class AnchorRegularizer:
             import numpy as np
         except ImportError:
             return None
+        d, ctl = self._drift_split()
+        if d is None:
+            return None
         n0 = min(self._n0, m.means_raw.shape[0])
-        mu = m.means_raw[0:n0].numpy(copy=True).reshape(-1, 3)
-        a0 = self._anchor0[0:n0].numpy(copy=True).reshape(-1, 3)
-        keep = self._orig[0:n0].numpy(copy=True).reshape(-1) > 0.5
-        d_all = np.linalg.norm(mu - a0, axis=1)
-        d = d_all[keep]
+        n_ctl = int(ctl.size) if ctl is not None else 0
         if d.size == 0:
-            d = d_all  # degenerate: everything relocated; report unfiltered
+            # Degenerate: every anchored slot was relocated. Report the
+            # unfiltered distances rather than zeros, which would read as a
+            # perfect result.
+            mu = m.means_raw[0:n0].numpy(copy=True).reshape(-1, 3)
+            a0 = self._anchor0[0:n0].numpy(copy=True).reshape(-1, 3)
+            d = np.linalg.norm(mu - a0, axis=1)
         out = {
             "rows": int(n0),
-            "rows_measured": int(keep.sum()),
-            "rows_excluded": int(n0 - keep.sum()),
+            "rows_measured": int(d.size),
+            "rows_excluded": int(n0 - d.size - n_ctl),
+            "rows_control": n_ctl,
             "baseline_valid": bool(self._baseline_valid),
             "recaptured_at_iter": int(self._recaptured_at),
         }
@@ -827,6 +1262,11 @@ class AnchorRegularizer:
         # the bulk of the rows free, so the median tracks the unanchored
         # baseline and only the upper tail shows what the leash did.
         out.update(drift_percentiles(d))
+        # Bounded tail counts. Measured against the cloud's own point
+        # spacing, NOT the dead zone: the dead zone differs per arm by
+        # construction, so counting against it would give every arm a
+        # different threshold and nothing could be compared across them.
+        out.update(escape_counts(d, self._nn_spacing))
         out.update({
             "scene_diag": float(self._scene_diag),
             "teleports": int(self.stat_teleports),
@@ -835,6 +1275,81 @@ class AnchorRegularizer:
             "applied_iters": int(self.stat_applied_iters),
         })
         return out
+
+    def control_drift_stats(self):
+        """Free-drift distribution read off the held-out control rows.
+
+        This is the calibration input and, in an anchored run, the only
+        estimate available of what the drift would have been without the
+        leash. Every candidate quantile is recorded so q can be chosen
+        afterwards from runs already on disk instead of costing one training
+        run per candidate.
+
+        Returns None when calibration is off (there are no control rows).
+        """
+        _d, ctl = self._drift_split()
+        if ctl is None or ctl.size == 0:
+            return None
+        out = {"rows": int(ctl.size)}
+        out.update(drift_percentiles(ctl))
+        out.update(control_quantiles(ctl))
+        return out
+
+    def tail_diag_stats(self, k=32):
+        """Profile the largest drifters, to explain the extreme tail.
+
+        At --max-cap 8000000 the leash clamps the tail reliably; at
+        16000000 two otherwise identical runs ended at max drift 16.657 and
+        1.759 with the same relocation count, exclusion rate and p95. That
+        difference is one row, and only the row itself distinguishes a
+        relocation the teleport detector missed from a row below
+        min_pull_opacity, which by design is never pulled at all.
+        """
+        m = self._model()
+        if m is None or self._anchor0 is None or self._n0 == 0:
+            return None
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        try:
+            n0 = min(self._n0, m.means_raw.shape[0])
+            mu = m.means_raw[0:n0].numpy(copy=True).reshape(-1, 3)
+            a0 = self._anchor0[0:n0].numpy(copy=True).reshape(-1, 3)
+            an = self._anchor[0:n0].numpy(copy=True).reshape(-1, 3)
+            orig = self._orig[0:n0].numpy(copy=True).reshape(-1) > 0.5
+            if self._control is not None:
+                orig &= ~(self._control[0:n0].numpy(copy=True).reshape(-1) > 0.5)
+            if not orig.any():
+                return None
+            drift = np.linalg.norm(mu[orig] - a0[orig], axis=1)
+            resid = np.linalg.norm(mu[orig] - an[orig], axis=1)
+            op_raw = m.opacity_raw[0:n0].numpy(copy=True).reshape(-1)[orig]
+            opacity = 1.0 / (1.0 + np.exp(-op_raw))
+            scal = m.scaling_raw[0:n0].numpy(copy=True).reshape(-1, 3)[orig]
+            max_axis = np.exp(scal.astype(np.float32)).max(axis=1)
+        except Exception as e:
+            lf.log.error(f"[maintain_pointcloud] tail diagnostics failed: {e!r}")
+            return None
+        return tail_diagnostics(drift, opacity, max_axis, resid, k=k,
+                                min_pull_opacity=self.min_pull_opacity)
+
+    def shape_stats(self):
+        """Splat max-axis scale distribution and occupied-volume proxy.
+
+        Position anchoring is measured to inflate splat scale (+4.6% median
+        on RAMESSES/Chest) while improving the drift percentiles, so the
+        drift numbers alone overstate the geometric result.
+        """
+        m = self._model()
+        if m is None:
+            return None
+        try:
+            raw = m.scaling_raw.numpy(copy=True)
+        except Exception as e:
+            lf.log.error(f"[maintain_pointcloud] scaling read failed: {e!r}")
+            return None
+        return scale_stats(raw)
 
     # ------------------------------------------------------------ configuration
     def config_dict(self):
@@ -861,9 +1376,22 @@ class AnchorRegularizer:
             "log_every": self.log_every,
             "stats_out": self.stats_out,
             "stats_snapshot_every": self.stats_snapshot_every,
+            "calibrate": self.calibrate,
+            "control_fraction": self.control_fraction,
+            "calibrate_quantile": self.calibrate_quantile,
+            "calibrate_every": self.calibrate_every,
+            "calibrate_start": self.calibrate_start,
+            "calibrate_seed": self.calibrate_seed,
+            "calibrate_min_spacing": self.calibrate_min_spacing,
+            "calibrated_radius": self._calibrated_radius,
+            "reanchor_on_split": self.reanchor_on_split,
+            "crop_box": self.crop_box,
+            "crop_box_pad": self.crop_box_pad,
+            "crop_box_applied": self._crop_box_applied,
         }
 
-    _READONLY_CFG = ("free_radius_effective", "nn_spacing")
+    _READONLY_CFG = ("free_radius_effective", "nn_spacing", "calibrated_radius",
+                     "crop_box_applied")
 
     def load_config(self, cfg):
         for k, v in (cfg or {}).items():

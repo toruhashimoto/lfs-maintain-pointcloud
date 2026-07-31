@@ -48,6 +48,25 @@ class AnchorPanel(lf.ui.Panel):
             "Min pull opacity (0=off)", reg.min_pull_opacity, 0.001, 0.01, "%.3f")
 
         ui.separator()
+        ui.text_disabled("Dead zone calibration")
+        _, reg.calibrate = ui.checkbox(
+            "Calibrate dead zone from control rows", reg.calibrate)
+        _, reg.control_fraction = ui.input_float(
+            "  control row fraction", reg.control_fraction, 0.005, 0.01, "%.3f")
+        _, reg.calibrate_quantile = ui.input_float(
+            "  target quantile of free drift", reg.calibrate_quantile,
+            1.0, 5.0, "%.0f")
+        _, reg.calibrate_every = ui.input_int(
+            "  recalibrate every N iters", reg.calibrate_every)
+        _, reg.calibrate_start = ui.input_int(
+            "  start calibrating at iter", reg.calibrate_start)
+        if reg.calibrate:
+            ui.text_disabled(
+                "  in force: %.6f (static bound %.6f)"
+                % (reg._effective_free_radius(),
+                   reg.free_radius_spacing * reg._nn_spacing))
+
+        ui.separator()
         ui.text_disabled("Schedule")
         _, reg.warmup_iters = ui.input_int("Warmup iters", reg.warmup_iters)
         _, reg.start_iter = ui.input_int("Start iter", reg.start_iter)

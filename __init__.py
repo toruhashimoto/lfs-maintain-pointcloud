@@ -10,11 +10,12 @@ import lichtfeld as lf
 
 from .anchor_core import AnchorRegularizer, apply_env_overrides
 from .panels.anchor_panel import AnchorPanel
+from .panels.crop_panel import InputCropPanel
 
 regularizer = apply_env_overrides(AnchorRegularizer())
 
 _handler = None
-_classes = [AnchorPanel]
+_classes = [AnchorPanel, InputCropPanel]
 
 
 def on_load():
