@@ -17,6 +17,20 @@
 | C | 1,111 | 4,302,501 | 手作業クリーンアップの解析 |
 | D | 1,098 | 4,085,318 | 入力クロップの 2 つ目の被写体での再現（8 本 + スモーク） |
 
+### 一次資料（生の集計出力）
+
+このページの数値は下記から起こしてある。**run ディレクトリは測定したマシンにしか
+残っていないので、この 2 ファイルが再生成できない一次資料**である。消さないこと。
+
+| ファイル | 中身 |
+|---|---|
+| [`2026-07-29-campaign-summary.tsv`](2026-07-29-campaign-summary.tsv) | run 1 行 × 指標 1 列の生テーブル（`drift_p50..p95` / `drift_max` / `scale_*` / `volume` / `teleports` / 対照行の分位点ほか） |
+| [`2026-07-29-campaign-analysis.txt`](2026-07-29-campaign-analysis.txt) | 上を腕ごとに集計した A/B 比較（各腕の平均、アーム内ばらつき、効果、効果/ノイズ） |
+
+どちらも `python scripts/analyze_campaign.py <runs-B>` の出力。腕の定義
+（run 名 → 腕名の対応）は [`analyze_campaign.py`](../scripts/analyze_campaign.py)
+の `ARMS` にハードコードしてあり、どの run がどの条件だったかはそこが正である。
+
 ---
 
 ## 実測（実データ 30000 iter A/B、検証済み）
